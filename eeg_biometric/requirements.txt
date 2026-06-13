@@ -1,5 +1,5 @@
 # --- Core (required) ---
-numpy>=1.21
+numpy>=1.21,<3        # 上限: NumPy 2.0 で np.trapz 等の API 変更があるため(コードは両対応)
 
 # --- Recommended (graceful NumPy fallbacks exist if any are missing) ---
 scipy>=1.7            # filtering / Welch PSD / peak finding   (else numpy fallbacks)

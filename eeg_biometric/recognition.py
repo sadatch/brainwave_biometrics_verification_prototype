@@ -23,6 +23,7 @@ as a stricter, lower-FAR alternative.
 """
 from __future__ import annotations
 
+import warnings
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -106,8 +107,10 @@ class OpenSetRecognizer:
     gamma : RBF kernel coefficient (``"scale"`` recommended).
     fusion_weight : weight ``w`` on the OC-SVM probability; LightGBM gets ``1−w``.
     threshold : accept threshold on the decision score.
-    mode : ``"fusion"`` (threshold the fused score) or ``"and"`` (both branches must
-        pass ``threshold``) — the latter trades FRR for a lower FAR.
+    mode : ``"and"`` (default; both branches must pass their *own* calibrated
+        threshold — the secure choice that closes the open-set hole where a high
+        LightGBM probability could override a low OC-SVM novelty score) or
+        ``"fusion"`` (threshold the single fused score).
     random_state : RNG seed for the discriminative model.
     """
 
@@ -117,7 +120,7 @@ class OpenSetRecognizer:
         gamma: str = "scale",
         fusion_weight: float = 0.5,
         threshold: float = 0.5,
-        mode: str = "fusion",
+        mode: str = "and",
         lgbm_params: Optional[dict] = None,
         random_state: int = 0,
     ) -> None:
@@ -126,7 +129,9 @@ class OpenSetRecognizer:
         self.nu = float(nu)
         self.gamma = gamma
         self.fusion_weight = float(np.clip(fusion_weight, 0.0, 1.0))
-        self.threshold = float(threshold)
+        self.threshold = float(threshold)        # fused-score threshold ("fusion" mode)
+        self.threshold_oc = float(threshold)     # per-branch thresholds ("and" mode)
+        self.threshold_lgbm = float(threshold)
         self.mode = mode
         self.lgbm_params = lgbm_params
         self.random_state = int(random_state)
@@ -205,15 +210,24 @@ class OpenSetRecognizer:
     def verify(
         self, embed: np.ndarray, threshold: Optional[float] = None, mode: Optional[str] = None
     ) -> Tuple[bool, Dict[str, float]]:
-        """Decide accept/reject for one embedding; returns ``(accept, scores)``."""
-        t = self.threshold if threshold is None else float(threshold)
+        """Decide accept/reject for one embedding; returns ``(accept, scores)``.
+
+        In ``"and"`` mode each branch is compared against its *own* calibrated
+        threshold (``threshold_oc`` / ``threshold_lgbm``); a single ``threshold``
+        argument, if given, overrides both. In ``"fusion"`` mode the fused score is
+        compared against ``threshold``.
+        """
         m = self.mode if mode is None else mode
         s = self.score(embed)
         if m == "and":
-            accept = (s["ocsvm_p"] >= t) and (s["lgbm_p"] >= t)
+            t_oc = self.threshold_oc if threshold is None else float(threshold)
+            t_lg = self.threshold_lgbm if threshold is None else float(threshold)
+            accept = (s["ocsvm_p"] >= t_oc) and (s["lgbm_p"] >= t_lg)
+            s.update(decision=bool(accept), threshold_oc=t_oc, threshold_lgbm=t_lg, mode=m)
         else:
+            t = self.threshold if threshold is None else float(threshold)
             accept = s["fused"] >= t
-        s.update(decision=bool(accept), threshold=t, mode=m)
+            s.update(decision=bool(accept), threshold=t, mode=m)
         return bool(accept), s
 
     # ------------------------------------------------------------- utilities
@@ -223,22 +237,48 @@ class OpenSetRecognizer:
         impostor_embeds: Sequence[np.ndarray],
         target_far: float = 0.01,
         grid: Optional[Sequence[float]] = None,
-    ) -> float:
-        """Pick the smallest fused-score threshold whose FAR ≤ ``target_far``.
+    ):
+        """Calibrate the decision threshold(s) **consistently with the active mode**.
 
-        Choosing the *smallest* such threshold keeps FRR as low as possible while
-        meeting the security (FAR) budget.
+        Uses *both* genuine and impostor scores. For each relevant score (the fused
+        score in ``"fusion"`` mode; the OC-SVM and LightGBM branch scores separately
+        in ``"and"`` mode) it picks the threshold meeting ``target_far`` with the
+        lowest FRR. If no threshold can meet ``target_far`` it does **not** silently
+        keep the default (the previous fail-open behaviour): it emits a
+        ``RuntimeWarning`` and falls back to the equal-error-rate (EER) point.
         """
-        imp = [self.score(e)["fused"] for e in impostor_embeds]
-        grid = list(grid) if grid is not None else list(np.linspace(0.05, 0.95, 19))
-        chosen = self.threshold
-        for t in sorted(grid):
-            far = float(np.mean([s >= t for s in imp])) if imp else 0.0
-            if far <= target_far:
-                chosen = t
-                break
-        self.threshold = float(chosen)
+        grid = sorted(grid) if grid is not None else list(np.linspace(0.05, 0.95, 19))
+        gs = [self.score(e) for e in genuine_embeds]
+        isc = [self.score(e) for e in impostor_embeds]
+        if self.mode == "and":
+            self.threshold_oc = self._calibrate_branch(
+                [g["ocsvm_p"] for g in gs], [i["ocsvm_p"] for i in isc], target_far, grid, "OC-SVM")
+            self.threshold_lgbm = self._calibrate_branch(
+                [g["lgbm_p"] for g in gs], [i["lgbm_p"] for i in isc], target_far, grid, "LightGBM")
+            return (self.threshold_oc, self.threshold_lgbm)
+        self.threshold = self._calibrate_branch(
+            [g["fused"] for g in gs], [i["fused"] for i in isc], target_far, grid, "fused")
         return self.threshold
+
+    @staticmethod
+    def _calibrate_branch(g_scores, i_scores, target_far, grid, name) -> float:
+        """Choose a per-branch threshold (target-FAR feasible → min FRR, else EER)."""
+        def far(t: float) -> float:
+            return float(np.mean([s >= t for s in i_scores])) if i_scores else 0.0
+
+        def frr(t: float) -> float:
+            return float(np.mean([s < t for s in g_scores])) if g_scores else 0.0
+
+        feasible = [t for t in grid if far(t) <= target_far]
+        if feasible:
+            return float(min(feasible, key=lambda t: (frr(t), t)))
+        eer = float(min(grid, key=lambda t: abs(far(t) - frr(t))))
+        warnings.warn(
+            f"[OpenSetRecognizer] {name}: no threshold meets target FAR={target_far}; "
+            f"falling back to EER point t={eer:.2f} (FAR={far(eer):.2f}, FRR={frr(eer):.2f}).",
+            RuntimeWarning,
+        )
+        return eer
 
     def evaluate(
         self,
@@ -254,11 +294,13 @@ class OpenSetRecognizer:
         frr = 1.0 - (sum(tg) / ng)
         far = sum(ti) / ni
         acc = (sum(tg) + (len(ti) - sum(ti))) / (len(tg) + len(ti) or 1)
+        m = self.mode if mode is None else mode
         return {
             "FAR": float(far), "FRR": float(frr), "ACC": float(acc),
             "n_genuine": len(tg), "n_impostor": len(ti),
             "threshold": self.threshold if threshold is None else float(threshold),
-            "mode": self.mode if mode is None else mode,
+            "threshold_oc": self.threshold_oc, "threshold_lgbm": self.threshold_lgbm,
+            "mode": m,
         }
 
     @property

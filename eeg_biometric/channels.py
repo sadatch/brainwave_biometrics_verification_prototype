@@ -18,6 +18,7 @@ Why Elastic Net (L1 + L2)
 """
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -195,17 +196,27 @@ class ElasticNetChannelSelector:
                 rng.choice(idx0, size=len(idx0), replace=True),
                 rng.choice(idx1, size=len(idx1), replace=True),
             ])
+            max_iter = 3000
             try:
                 clf = LogisticRegression(
                     penalty="elasticnet", solver="saga", l1_ratio=self.l1_ratio,
-                    C=self.C, max_iter=2000, tol=1e-3,
+                    C=self.C, max_iter=max_iter, tol=1e-3,
                 )
-                clf.fit(X[bs], y[bs])
+                with warnings.catch_warnings():
+                    # saga 未収束 / penalty 非推奨の大量警告は抑制（収束は n_iter_ で判定）。
+                    warnings.simplefilter("ignore")
+                    clf.fit(X[bs], y[bs])
             except Exception:
+                continue
+            # 未収束の当て嵌めは選択頻度推定を歪めるため計数しない。
+            if int(np.max(np.atleast_1d(getattr(clf, "n_iter_", [max_iter])))) >= max_iter:
                 continue
             counts += (np.abs(clf.coef_.ravel()) > 1e-6).astype(float)
             successful += 1
-        if successful == 0:  # saga failed everywhere → fall back
+        if successful == 0:  # 収束した当て嵌めが皆無 → F-score にフォールバック
+            warnings.warn(
+                "[ElasticNetChannelSelector] no Elastic-Net fit converged; "
+                "falling back to ANOVA F-score selection.", RuntimeWarning)
             return self._fscore_selection(X, y)
         return counts / successful
 
@@ -243,6 +254,12 @@ class ElasticNetChannelSelector:
         for ci in range(n_ch):
             cols = np.where(channel_of_feature == ci)[0]
             ch_score[ci] = float(feat_freq[cols].mean()) if len(cols) else 0.0
+
+        if float(np.max(ch_score)) <= 1e-9:  # 全特徴が無情報 → 機械的に先頭を採用
+            warnings.warn(
+                "[ElasticNetChannelSelector] selection is uninformative (all channel "
+                f"scores ~0); arbitrarily taking the first {self.min_channels} channels.",
+                RuntimeWarning)
 
         keep = np.where(ch_score >= self.selection_threshold)[0]
         order = np.argsort(ch_score)[::-1]

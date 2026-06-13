@@ -71,14 +71,27 @@ encoder. This keeps the architecture truthful without faking learned discriminab
 The One-Class SVM (SVDD) is trained on the enrollee's genuine embeddings *only* and bounds
 the false-accept rate against *novel* attackers (open-set term). LightGBM, trained
 genuine-vs-background, sharpens the boundary against the *known* impostor distribution
-(closed-set term). Scores are Platt-calibrated and fused; an `and` gate (both must pass) is
-available as a stricter, lower-FAR alternative. The demo keeps the background cohort
-**disjoint** from the evaluation impostors so the open-set claim is honest.
+(closed-set term). Scores are Platt-calibrated. The **default decision rule is the `and`
+gate** (each branch must pass its *own* calibrated threshold) — the secure choice that
+closes the open-set hole where a high LightGBM probability could otherwise override a low
+OC-SVM novelty score; `fusion` (weighted average of the two) is available as an alternative.
+Threshold calibration is **mode-aware** and **fail-loud**: it targets a FAR budget using
+both genuine and impostor scores and, if the budget is unreachable, warns and falls back to
+the equal-error-rate point instead of silently leaving the default. The demo keeps the
+background cohort, the calibration impostor, and the evaluation impostors all **mutually
+disjoint**, and measures genuine trials *with* the same on-cue blink as the accept path so
+FAR/FRR are not optimistic.
 
 **Liveness before ATAR.** ATAR removes exactly the blink/EOG the liveness check relies on,
 so the detector taps the raw stream. The active challenge carries a nonce and a random
 time window; it checks blink **presence/count**, **timing inside the window**, and
 **no blink before the prompt** — together these reject static replays and spliced clips.
+The nonce is actually **bound and enforced** (opt-in flags on `LivenessDetector`, enabled in
+the demo and the GUI): a challenge can **expire** (`max_age_seconds`), the response must
+**echo the nonce** (`require_nonce_echo`), and each nonce is **single-use**
+(`track_nonce`) — so a captured recording cannot be replayed (demo scenario S6). The desktop
+app (`main.py`) issues these challenges at **random times** with an on-screen "blink now"
+prompt and evaluates only that response window.
 
 **GAN as a dual-use *defensive* tool.** `adversarial.py` provides a generator (a small
 `EEGGAN`, or a NumPy phase-randomised `SurrogateEEGGenerator` fallback) for two purposes:
@@ -108,12 +121,22 @@ python -m eeg_biometric.pipeline         # from the parent directory
 # or:  cd eeg_biometric && python pipeline.py
 ```
 
-The demo prints the active backends, enrolls subject `S001`, then runs five scenarios —
-genuine+blink (accept), impostor+blink (reject on identity), genuine replay without a
-blink (reject on liveness), a mistimed blink (reject on liveness), and a GAN/surrogate
-spoof without a blink (reject on liveness) — followed by FAR/FRR/ACC for the biometric
-branch. Enrollment-time GAN augmentation is available via
+The demo prints the active backends, enrolls subject `S001`, then runs six scenarios —
+genuine+blink (accept), impostor+blink (reject on identity), genuine without a blink
+(reject on liveness), a mistimed blink (reject on liveness), a GAN/surrogate spoof
+(reject on liveness), and a replay of a used nonce (reject on anti-replay) — followed by
+FAR/FRR/ACC for the biometric branch. Enrollment-time GAN augmentation is available via
 `PipelineConfig(use_gan_augmentation=True)`.
+
+### Tests / CI
+
+```bash
+python -m pytest -q tests        # enroll→verify smoke + band-power(np.trapz) + montage guard
+```
+
+`.github/workflows/ci.yml` runs the smoke tests and the end-to-end demo on both NumPy 1.x
+and 2.x, so the kind of issues a single run surfaces (e.g. the `np.trapz` removal, a broken
+enroll) are caught automatically.
 
 ## Limitations & next steps
 

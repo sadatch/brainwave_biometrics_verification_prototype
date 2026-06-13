@@ -17,6 +17,9 @@ except Exception:  # pragma: no cover - exercised only without SciPy
     _HAVE_SCIPY = False
 
 
+# NumPy 2.0 で ``np.trapz`` は削除された(``np.trapezoid`` に改称)。両対応のシム。
+_trapz = getattr(np, "trapezoid", None) or np.trapz
+
 # Canonical EEG frequency bands (Hz).
 EEG_BANDS: Dict[str, Tuple[float, float]] = {
     "delta": (1.0, 4.0),
@@ -71,7 +74,7 @@ def bandpower(
     idx = (f >= lo) & (f <= hi)
     if not np.any(idx):
         return 0.0
-    return float(np.trapz(p[idx], f[idx]))
+    return float(_trapz(p[idx], f[idx]))
 
 
 def band_powers(
@@ -83,7 +86,7 @@ def band_powers(
     """Return per-band power (relative to total by default)."""
     bands = bands or EEG_BANDS
     f, p = power_spectral_density(x, sfreq)
-    total = float(np.trapz(p, f)) + 1e-12
+    total = float(_trapz(p, f)) + 1e-12
     out: Dict[str, float] = {}
     for name, b in bands.items():
         bp = bandpower(x, sfreq, b, psd=(f, p))
@@ -117,12 +120,18 @@ def spectral_edge_frequency(x: Sequence[float], sfreq: float, edge: float = 0.95
     return float(f[idx])
 
 
-def robust_zscore(x: Sequence[float]) -> np.ndarray:
-    """Median/MAD-based z-score, resistant to artifact outliers."""
+def robust_zscore(x: Sequence[float], min_scale: float = 0.0) -> np.ndarray:
+    """Median/MAD-based z-score, resistant to artifact outliers.
+
+    ``min_scale`` sets an absolute floor (in signal units) on the MAD-derived
+    scale. Without it, a dead/rail-stuck channel has MAD≈0 and the z-score
+    explodes, causing spurious blink detections downstream. Pass e.g. a few µV
+    for EEG.
+    """
     x = np.asarray(x, dtype=float)
     med = np.median(x)
     mad = np.median(np.abs(x - med))
-    scale = 1.4826 * mad + 1e-12
+    scale = max(1.4826 * mad, float(min_scale)) + 1e-12
     return (x - med) / scale
 
 

@@ -86,7 +86,7 @@ class PipelineConfig:
     nu: float = 0.1
     fusion_weight: float = 0.5
     decision_threshold: float = 0.5
-    recognizer_mode: str = "fusion"   # "fusion"|"and"
+    recognizer_mode: str = "and"      # "and"(防御既定: 両ブランチ通過必須) | "fusion"
     target_far: float = 0.05
     # liveness
     liveness_amp_z: float = 4.0
@@ -107,6 +107,7 @@ class Enrollment:
     encoder: object
     recognizer: OpenSetRecognizer
     selected_channels: List[str]
+    channels: List[str]          # full channel set seen at enrollment (montage guard)
     threshold: float
     n_genuine: int
     n_background: int
@@ -211,10 +212,14 @@ class EEGBiometricPipeline:
 
         enr = Enrollment(
             subject_id=subject_id, selector=selector, encoder=encoder, recognizer=recognizer,
-            selected_channels=selector.selected_channels, threshold=recognizer.threshold,
-            n_genuine=len(gen), n_background=len(bg),
+            selected_channels=selector.selected_channels, channels=list(ch_names),
+            threshold=recognizer.threshold, n_genuine=len(gen), n_background=len(bg),
         )
         self.enrollments[subject_id] = enr
+        if recognizer.mode == "and":
+            thr = {"oc": round(recognizer.threshold_oc, 3), "lgbm": round(recognizer.threshold_lgbm, 3)}
+        else:
+            thr = round(float(recognizer.threshold), 3)
         return {
             "subject_id": subject_id,
             "selected_channels": enr.selected_channels,
@@ -223,7 +228,8 @@ class EEGBiometricPipeline:
             "encoder": getattr(encoder, "name", type(encoder).__name__),
             "embed_dim": int(g_emb.shape[1]),
             "recognizer_backend": recognizer.backend,
-            "threshold": round(float(enr.threshold), 3),
+            "mode": recognizer.mode,
+            "threshold": thr,
         }
 
     # -------------------------------------------------------------- verify
@@ -247,14 +253,24 @@ class EEGBiometricPipeline:
 
         # 2) Biometric path on the ATAR-cleaned signal.
         cleaned = self.atar.transform(raw_trial)
+
+        # Montage guard: the enrolled (selected) channels must all be present, else
+        # the embedding dimensionality silently changes and the recogniser breaks.
+        missing = [ch for ch in enr.selected_channels if cleaned.channel_index(ch) is None]
+        if missing:
+            return AuthResult(claimed_id, False, "montage_error", live, None,
+                              reason=f"enrolled channels missing from input: {missing}")
+
         idx = enr.selector.selected_indices_for(cleaned)
         emb = enr.encoder.embed(cleaned, channel_idx=idx)
-        accept, scores = enr.recognizer.verify(emb, threshold=enr.threshold)
+        # No explicit threshold → recogniser applies its own mode-aware calibrated
+        # threshold(s) (per-branch in "and" mode).
+        accept, scores = enr.recognizer.verify(emb)
 
         decision = bool(live.passed and accept)
         stage = "accept" if decision else "recognition_reject"
-        reason = "liveness+biometric_match" if decision else \
-                 f"biometric_score {scores['fused']:.3f} < thr {enr.threshold:.3f}"
+        reason = ("liveness+biometric_match" if decision else
+                  f"biometric reject (oc={scores['ocsvm_p']:.2f}, lgbm={scores['lgbm_p']:.2f})")
         return AuthResult(claimed_id, decision, stage, live, scores, reason=reason)
 
     # ------------------------------------------------------------ metrics
@@ -268,7 +284,8 @@ class EEGBiometricPipeline:
         enr = self.enrollments[claimed_id]
         g = self._embed_trials(enr.selector, enr.encoder, self.atar.transform_many(genuine_trials))
         i = self._embed_trials(enr.selector, enr.encoder, self.atar.transform_many(impostor_trials))
-        return enr.recognizer.evaluate(list(g), list(i), threshold=enr.threshold)
+        # threshold は渡さない → 認識器がモード別の較正済み閾値(AND ならブランチ別)を使用。
+        return enr.recognizer.evaluate(list(g), list(i))
 
 
 # --------------------------------------------------------------------------- #
@@ -324,15 +341,26 @@ def main() -> None:
                            trial_seconds=config.trial_seconds, seed=config.random_state)
     _print_backends(pipe, source)
 
-    # ---- cohorts (background cohort is DISJOINT from evaluation impostors) ----
+    # ---- cohorts (background / calibration / evaluation の被験者は互いに素) ----
     enrollee = "S001"
     eval_impostors = ["S002", "S003", "S004"]
     background_ids = ["B01", "B02", "B03", "B04"]
+    calib_impostor_id = "C01"        # 背景にも評価にも含まれない較正専用 impostor
 
-    genuine_all = source.get_subject_trials(enrollee, n_trials=24, base_seed=1)
+    # 実運用の受理経路は必ずオンキュー瞬目を伴う。登録・較正・評価の全 trial に
+    # 同条件の瞬目を入れ、ATAR 後の残差分布を train/eval で一致させる(誠実な指標)。
+    train_cue = [config.trial_seconds / 2.0]
+
+    def fetch(sid, n, seed):
+        return source.get_subject_trials(sid, n_trials=n, with_blink=True,
+                                         blink_times=train_cue, base_seed=seed)
+
+    genuine_all = fetch(enrollee, 24, 1)
     genuine_enroll, genuine_calib = genuine_all[:18], genuine_all[18:]
-    background = _gather(source, background_ids, n_each=8, base_seed=100)
-    calib_impostor = source.get_subject_trials(eval_impostors[0], n_trials=8, base_seed=200)
+    background = []
+    for k, bid in enumerate(background_ids):
+        background += fetch(bid, 8, 100 + 10 * k)
+    calib_impostor = fetch(calib_impostor_id, 8, 200)
 
     print("\nEnrolling", enrollee, "...")
     summary = pipe.enroll(enrollee, genuine_enroll, background,
@@ -340,62 +368,81 @@ def main() -> None:
     print(f"  selected {summary['n_selected']} channels via {summary['selection_method']}: "
           f"{summary['selected_channels']}")
     print(f"  encoder={summary['encoder']} (dim={summary['embed_dim']}), "
-          f"recognizer[{summary['recognizer_backend']}], threshold={summary['threshold']}")
+          f"recognizer[{summary['recognizer_backend']}], mode={summary['mode']}, "
+          f"threshold={summary['threshold']}")
 
     # Deep-encoder architectural showcase (separate from scoring encoder).
     _showcase_deep_encoder(config, pipe.atar.transform(genuine_enroll[0]))
 
-    # ---- scenarios -----------------------------------------------------------
-    challenge = pipe.liveness.make_challenge(trial_duration=config.trial_seconds, rng=rng)
-    cue = challenge.blink_cue_time
-    early = max(0.1, challenge.prompt_time - 0.7)
-    print(f"\nLiveness challenge: blink within window "
-          f"[{challenge.window[0]:.2f}s, {challenge.window[1]:.2f}s]  nonce={challenge.nonce[:8]}")
+    # Deep-encoder architectural showcase moved above; now run scenarios.
+    # ---- anti-replay を実運用相当に有効化 ----
+    pipe.liveness.track_nonce = True            # 使用済み nonce を拒否
+    pipe.liveness.require_nonce_echo = True      # 応答に nonce エコー必須
+    pipe.liveness.max_age_seconds = 30.0         # チャレンジの失効
 
-    # Defensive red-team (survey hypothesis 4): synthesise a spoof of the enrollee
-    # with NO on-cue blink and confirm the pipeline rejects it.
+    def fresh_challenge():
+        """認証試行ごとに新しい nonce/時間窓のチャレンジを発行する。"""
+        return pipe.liveness.make_challenge(trial_duration=config.trial_seconds, rng=rng)
+
+    def make_trial(sid, seed, blink_at, nonce):
+        bt = [blink_at] if blink_at is not None else None
+        tr = source.get_subject_trials(sid, 1, with_blink=blink_at is not None,
+                                       blink_times=bt, base_seed=seed)[0]
+        tr.echoed_nonce = nonce      # 正規デバイスはチャレンジの nonce をエコーする
+        return tr
+
+    # 防御レッドチーム(仮説4): 本人を模した合成スプーフ(オンキュー瞬目なし)。
     try:
         from .adversarial import PresentationAttackSimulator, make_generator
     except ImportError:
         from adversarial import PresentationAttackSimulator, make_generator
     attacker = PresentationAttackSimulator(
         make_generator(config.gan_backend, seed=config.random_state)).fit(genuine_enroll)
-    spoof_trial = attacker.synthesize_spoofs(1, inject_blink=False)[0]
     print(f"Attack simulator: {attacker.generator.name} "
           f"(defensive red-team; spoof carries no on-cue blink)")
 
+    ch1 = fresh_challenge(); s1 = make_trial(enrollee, 900, ch1.blink_cue_time, ch1.nonce)
+    ch2 = fresh_challenge(); s2 = make_trial(eval_impostors[1], 901, ch2.blink_cue_time, ch2.nonce)
+    ch3 = fresh_challenge(); s3 = make_trial(enrollee, 902, None, ch3.nonce)
+    ch4 = fresh_challenge(); s4 = make_trial(enrollee, 903, max(0.1, ch4.prompt_time - 0.7), ch4.nonce)
+    ch5 = fresh_challenge()
+    spoof_trial = attacker.synthesize_spoofs(1, inject_blink=False)[0]
+    spoof_trial.echoed_nonce = ch5.nonce         # 攻撃者が nonce を盗用しても瞬目応答は作れない
+
     scenarios = [
-        ("S1 genuine + on-cue blink     (expect ACCEPT)",
-         source.get_subject_trials(enrollee, 1, with_blink=True, blink_times=[cue], base_seed=900)[0]),
-        ("S2 impostor + on-cue blink    (expect REJECT: identity)",
-         source.get_subject_trials(eval_impostors[1], 1, with_blink=True, blink_times=[cue], base_seed=901)[0]),
-        ("S3 genuine replay, NO blink   (expect REJECT: liveness)",
-         source.get_subject_trials(enrollee, 1, with_blink=False, base_seed=902)[0]),
-        ("S4 genuine, mistimed blink    (expect REJECT: liveness)",
-         source.get_subject_trials(enrollee, 1, with_blink=True, blink_times=[early], base_seed=903)[0]),
-        ("S5 GAN/surrogate spoof, no blink (expect REJECT: liveness)", spoof_trial),
+        ("S1 genuine + on-cue blink         (expect ACCEPT)", s1, ch1),
+        ("S2 impostor + on-cue blink        (expect REJECT: identity)", s2, ch2),
+        ("S3 genuine, NO blink              (expect REJECT: liveness)", s3, ch3),
+        ("S4 genuine, mistimed blink        (expect REJECT: liveness)", s4, ch4),
+        ("S5 GAN/surrogate spoof            (expect REJECT: liveness)", spoof_trial, ch5),
+        ("S6 replay of S1 (used nonce)      (expect REJECT: anti-replay)", s1, ch1),
     ]
 
     print("\nResults")
-    print("-" * 74)
-    for label, trial in scenarios:
-        res = pipe.verify(enrollee, trial, challenge)
+    print("-" * 78)
+    for label, trial, ch in scenarios:
+        res = pipe.verify(enrollee, trial, ch)
         verdict = "ACCEPT" if res.decision else "REJECT"
         live = res.liveness
-        live_str = f"live={'pass' if (live and live.passed) else 'fail'}" + \
-                   (f"(blinks_in_win={live.observed_in_window})" if live else "")
+        live_str = (f"live={'pass' if (live and live.passed) else 'fail'}"
+                    + (f"(blinks={live.observed_in_window})" if live else ""))
         bio = res.recognition
-        bio_str = f"bio_fused={bio['fused']:.3f}" if bio else "bio=skipped"
+        bio_str = (f"oc={bio['ocsvm_p']:.2f},lgbm={bio['lgbm_p']:.2f}" if bio else "bio=skipped")
         print(f"{verdict:6} | {label}")
         print(f"         {live_str}, {bio_str}  ->  {res.reason}")
-    print("-" * 74)
+    print("-" * 78)
 
-    # ---- batch biometric metrics (liveness held aside) -----------------------
-    eval_genuine = source.get_subject_trials(enrollee, n_trials=20, base_seed=300)
-    eval_impostor = _gather(source, eval_impostors, n_each=8, base_seed=400)
+    # ---- batch biometric metrics (genuine も受理経路と同じ“オンキュー瞬目あり”で測定) ----
+    eval_genuine = fetch(enrollee, 20, 300)
+    eval_impostor = []
+    for k, sid in enumerate(eval_impostors):
+        eval_impostor += fetch(sid, 8, 400 + 10 * k)
     metrics = pipe.biometric_metrics(enrollee, eval_genuine, eval_impostor)
-    print(f"\nBiometric branch metrics (threshold={metrics['threshold']:.3f}, "
-          f"mode={metrics['mode']}):")
+    if metrics["mode"] == "and":
+        thr_str = f"oc={metrics['threshold_oc']:.2f}, lgbm={metrics['threshold_lgbm']:.2f}"
+    else:
+        thr_str = f"{metrics['threshold']:.3f}"
+    print(f"\nBiometric branch metrics (mode={metrics['mode']}, threshold[{thr_str}]):")
     print(f"  FAR={metrics['FAR']:.3f}  FRR={metrics['FRR']:.3f}  ACC={metrics['ACC']:.3f}  "
           f"(genuine n={metrics['n_genuine']}, impostor n={metrics['n_impostor']})")
     print("\nDone. This is a defensive research prototype on public/synthetic data only.")

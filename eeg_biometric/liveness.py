@@ -25,6 +25,7 @@ The three checks that defeat replays
 """
 from __future__ import annotations
 
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -102,6 +103,10 @@ class LivenessDetector:
         max_blink_ms: float = 600.0,
         refractory_ms: float = 250.0,
         require_clean_pre_prompt: bool = True,
+        abs_uv_floor: float = 2.0,
+        max_age_seconds: Optional[float] = None,
+        require_nonce_echo: bool = False,
+        track_nonce: bool = False,
     ) -> None:
         self.frontal_channels = tuple(frontal_channels)
         self.amp_z_thresh = float(amp_z_thresh)
@@ -110,6 +115,13 @@ class LivenessDetector:
         self.max_blink_ms = float(max_blink_ms)
         self.refractory_ms = float(refractory_ms)
         self.require_clean_pre_prompt = bool(require_clean_pre_prompt)
+        # --- anti-replay の束縛（既定は無効。有効化すると nonce を実際に拘束する）---
+        self.abs_uv_floor = float(abs_uv_floor)          # MAD≈0 の死にチャネル対策(µV)
+        self.max_age_seconds = max_age_seconds            # 経過時間で失効
+        self.require_nonce_echo = bool(require_nonce_echo)  # 応答に nonce エコー必須
+        self.track_nonce = bool(track_nonce)              # 使用済み nonce を拒否
+        self._consumed: set = set()
+        self._lock = threading.Lock()
 
     # ----------------------------------------------------------- challenge
     def make_challenge(
@@ -133,8 +145,30 @@ class LivenessDetector:
         )
 
     # -------------------------------------------------------------- verify
-    def verify(self, raw_trial: EEGTrial, challenge: Challenge) -> LivenessResult:
-        """Check a raw (pre-ATAR) trial against ``challenge``."""
+    def verify(self, raw_trial: EEGTrial, challenge: Challenge, consume: bool = True) -> LivenessResult:
+        """Check a raw (pre-ATAR) trial against ``challenge``.
+
+        Anti-replay binding (only enforced when the corresponding flags are enabled):
+        the challenge may be **expired** (``max_age_seconds``), the response may fail
+        to **echo the nonce** (``require_nonce_echo``), or the nonce may be **already
+        used** (``track_nonce``). All three fail closed *before* any signal analysis.
+        On a completed assessment the nonce is marked consumed (single-use) unless
+        ``consume=False`` (e.g. while the same active challenge is polled repeatedly).
+        """
+        # --- anti-replay の事前チェック（フェイルクローズ）---
+        replay_reasons: List[str] = []
+        if self.max_age_seconds is not None and \
+                (time.time() - float(challenge.issued_at)) > self.max_age_seconds:
+            replay_reasons.append("challenge_expired")
+        if self.require_nonce_echo and raw_trial.echoed_nonce != challenge.nonce:
+            replay_reasons.append("nonce_mismatch")
+        if self.track_nonce:
+            with self._lock:
+                if challenge.nonce in self._consumed:
+                    replay_reasons.append("nonce_already_used(replay)")
+        if replay_reasons:
+            return LivenessResult(False, 0, 0, challenge.expected_blinks, 0.0, None, replay_reasons)
+
         reasons: List[str] = []
         idxs = [raw_trial.channel_index(n) for n in self.frontal_channels]
         idxs = [i for i in idxs if i is not None]
@@ -145,7 +179,8 @@ class LivenessDetector:
         frontal = raw_trial.data[idxs].mean(axis=0)
         sf = raw_trial.sfreq
         slow = lowpass_filter(frontal, sf, self.lowpass_hz)
-        zabs = np.abs(robust_zscore(slow))
+        # 絶対 σ フロアで死にチャネル(MAD≈0)による z 爆発・誤検知を防ぐ。
+        zabs = np.abs(robust_zscore(slow, min_scale=self.abs_uv_floor))
 
         distance = max(1, int(self.refractory_ms * 1e-3 * sf))
         peaks = detect_peaks(zabs, height=self.amp_z_thresh, distance=distance)
@@ -179,6 +214,10 @@ class LivenessDetector:
         score = self._confidence(len(in_window), challenge.expected_blinks, prepane_ok)
         if passed and not reasons:
             reasons.append("bona_fide_on_cue_blink_detected")
+        # nonce を単回使用として消費（リプレイ拒否）。
+        if self.track_nonce and consume:
+            with self._lock:
+                self._consumed.add(challenge.nonce)
         return LivenessResult(passed, len(in_window), len(pre_prompt),
                               challenge.expected_blinks, score, latency, reasons)
 

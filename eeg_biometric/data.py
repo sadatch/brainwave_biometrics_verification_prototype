@@ -68,6 +68,9 @@ class EEGTrial:
     subject : optional identity label (bookkeeping only).
     has_blink : whether an on-cue blink/EOG response is present (demo metadata).
     blink_times : onset times (s) of injected blinks, if any.
+    echoed_nonce : challenge nonce echoed back by the capture device (anti-replay).
+        The device should embed the nonce it received with the challenge so the
+        liveness verifier can bind the response to that specific challenge.
     """
 
     data: np.ndarray
@@ -76,6 +79,7 @@ class EEGTrial:
     subject: Optional[str] = None
     has_blink: bool = False
     blink_times: Tuple[float, ...] = ()
+    echoed_nonce: Optional[str] = None
 
     @property
     def n_channels(self) -> int:
@@ -106,6 +110,7 @@ class EEGTrial:
             subject=self.subject,
             has_blink=self.has_blink,
             blink_times=self.blink_times,
+            echoed_nonce=self.echoed_nonce,
         )
 
 
