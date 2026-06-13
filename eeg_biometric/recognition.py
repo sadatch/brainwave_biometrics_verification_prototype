@@ -247,21 +247,34 @@ class OpenSetRecognizer:
         keep the default (the previous fail-open behaviour): it emits a
         ``RuntimeWarning`` and falls back to the equal-error-rate (EER) point.
         """
-        grid = sorted(grid) if grid is not None else list(np.linspace(0.05, 0.95, 19))
+        g = list(grid) if grid is not None else None   # None → スコア分布から候補を生成
         gs = [self.score(e) for e in genuine_embeds]
         isc = [self.score(e) for e in impostor_embeds]
         if self.mode == "and":
             self.threshold_oc = self._calibrate_branch(
-                [g["ocsvm_p"] for g in gs], [i["ocsvm_p"] for i in isc], target_far, grid, "OC-SVM")
+                [x["ocsvm_p"] for x in gs], [x["ocsvm_p"] for x in isc], target_far, "OC-SVM", g)
             self.threshold_lgbm = self._calibrate_branch(
-                [g["lgbm_p"] for g in gs], [i["lgbm_p"] for i in isc], target_far, grid, "LightGBM")
+                [x["lgbm_p"] for x in gs], [x["lgbm_p"] for x in isc], target_far, "LightGBM", g)
             return (self.threshold_oc, self.threshold_lgbm)
         self.threshold = self._calibrate_branch(
-            [g["fused"] for g in gs], [i["fused"] for i in isc], target_far, grid, "fused")
+            [x["fused"] for x in gs], [x["fused"] for x in isc], target_far, "fused", g)
         return self.threshold
 
     @staticmethod
-    def _calibrate_branch(g_scores, i_scores, target_far, grid, name) -> float:
+    def _candidate_thresholds(g_scores, i_scores) -> List[float]:
+        """候補閾値を実スコア分布から生成（固定グリッドの端点張り付きを回避）。
+
+        全観測スコアの隣接中点に加え、両端（全受理 / 全拒否）も候補に含める。これにより
+        「最大 impostor スコアのすぐ上」のような最適動作点を直接選べる。
+        """
+        alls = sorted({float(s) for s in list(g_scores) + list(i_scores)})
+        if not alls:
+            return [0.5]
+        mids = [(a + b) / 2.0 for a, b in zip(alls[:-1], alls[1:])]
+        return sorted({alls[0] - 1e-3, *mids, alls[-1] + 1e-3})
+
+    @classmethod
+    def _calibrate_branch(cls, g_scores, i_scores, target_far, name, grid=None) -> float:
         """Choose a per-branch threshold (target-FAR feasible → min FRR, else EER)."""
         def far(t: float) -> float:
             return float(np.mean([s >= t for s in i_scores])) if i_scores else 0.0
@@ -269,10 +282,11 @@ class OpenSetRecognizer:
         def frr(t: float) -> float:
             return float(np.mean([s < t for s in g_scores])) if g_scores else 0.0
 
-        feasible = [t for t in grid if far(t) <= target_far]
+        cand = list(grid) if grid is not None else cls._candidate_thresholds(g_scores, i_scores)
+        feasible = [t for t in cand if far(t) <= target_far]
         if feasible:
             return float(min(feasible, key=lambda t: (frr(t), t)))
-        eer = float(min(grid, key=lambda t: abs(far(t) - frr(t))))
+        eer = float(min(cand, key=lambda t: abs(far(t) - frr(t))))
         warnings.warn(
             f"[OpenSetRecognizer] {name}: no threshold meets target FAR={target_far}; "
             f"falling back to EER point t={eer:.2f} (FAR={far(eer):.2f}, FRR={frr(eer):.2f}).",

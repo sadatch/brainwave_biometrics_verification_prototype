@@ -77,21 +77,34 @@ closes the open-set hole where a high LightGBM probability could otherwise overr
 OC-SVM novelty score; `fusion` (weighted average of the two) is available as an alternative.
 Threshold calibration is **mode-aware** and **fail-loud**: it targets a FAR budget using
 both genuine and impostor scores and, if the budget is unreachable, warns and falls back to
-the equal-error-rate point instead of silently leaving the default. The demo keeps the
-background cohort, the calibration impostor, and the evaluation impostors all **mutually
-disjoint**, and measures genuine trials *with* the same on-cue blink as the accept path so
-FAR/FRR are not optimistic.
+the equal-error-rate point instead of silently leaving the default. Candidate thresholds
+are taken from the **actual score distribution** (midpoints between observed scores) rather
+than a fixed grid, so the operating point can sit just above the impostor scores instead of
+pinning to a grid bound. The demo keeps the background cohort, the calibration impostors,
+and the evaluation impostors all **mutually disjoint**, and measures genuine trials *with*
+the same on-cue blink as the accept path so FAR/FRR are not optimistic. **Calibrate with
+*several* disjoint impostors**: a single calibration impostor does not generalise to unseen
+attackers (on the synthetic demo, one impostor gives FAR≈0.29 while five give FAR≈0.04), so
+`main()` uses `C01–C05`.
 
 **Liveness before ATAR.** ATAR removes exactly the blink/EOG the liveness check relies on,
 so the detector taps the raw stream. The active challenge carries a nonce and a random
 time window; it checks blink **presence/count**, **timing inside the window**, and
 **no blink before the prompt** — together these reject static replays and spliced clips.
-The nonce is actually **bound and enforced** (opt-in flags on `LivenessDetector`, enabled in
-the demo and the GUI): a challenge can **expire** (`max_age_seconds`), the response must
-**echo the nonce** (`require_nonce_echo`), and each nonce is **single-use**
-(`track_nonce`) — so a captured recording cannot be replayed (demo scenario S6). The desktop
-app (`main.py`) issues these challenges at **random times** with an on-screen "blink now"
-prompt and evaluates only that response window.
+The nonce is actually **bound and enforced**: a challenge can **expire**
+(`max_age_seconds`), each nonce is **single-use** (`track_nonce`, with a pruned ledger so it
+cannot grow without bound), and the response can be required to **echo the nonce**
+(`require_nonce_echo`). `track_nonce` and a finite `max_age_seconds` are **ON by default in
+`PipelineConfig`** (so `EEGBiometricPipeline().verify(...)` has replay protection out of the
+box); `require_nonce_echo` stays opt-in because it needs device cooperation. A captured
+recording therefore cannot be replayed (demo scenario S6). The desktop app (`main.py`)
+issues these challenges at **random times** with an on-screen "blink now" prompt and
+evaluates only that response window.
+
+**Threat-model boundary.** `echoed_nonce` is a plaintext field, *not* cryptographically
+bound to the signal: on an unauthenticated link an on-path attacker can copy it, so the echo
+alone only defeats *blind* replay. A production sensor should **MAC/sign `(samples ‖ nonce)`**
+at capture; the nonce machinery here is the software-side half of that protocol.
 
 **GAN as a dual-use *defensive* tool.** `adversarial.py` provides a generator (a small
 `EEGGAN`, or a NumPy phase-randomised `SurrogateEEGGenerator` fallback) for two purposes:

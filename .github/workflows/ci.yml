@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # NumPy 1.x と 2.x の両方で回し、np.trapz 系の回帰を確実に検知する。
+        numpy: ["numpy<2", "numpy>=2,<3"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install (core deps only; optional torch/lgbm/mne は省略しフォールバック経路も検証)
+        run: |
+          python -m pip install --upgrade pip
+          pip install "${{ matrix.numpy }}" scipy scikit-learn PyWavelets pytest
+      - name: Unit / smoke tests (enroll→verify, trapz, montage, anti-replay, FAR)
+        run: python -m pytest -q tests
+      - name: End-to-end demo (enroll → scenarios → metrics)
+        run: python -m eeg_biometric.pipeline

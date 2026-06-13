@@ -88,8 +88,11 @@ class PipelineConfig:
     decision_threshold: float = 0.5
     recognizer_mode: str = "and"      # "and"(防御既定: 両ブランチ通過必須) | "fusion"
     target_far: float = 0.05
-    # liveness
+    # liveness（anti-replay は既定 ON。require_nonce_echo はデバイス協調が要るのでオプトイン）
     liveness_amp_z: float = 4.0
+    liveness_track_nonce: bool = True
+    liveness_max_age_seconds: Optional[float] = 300.0
+    liveness_require_nonce_echo: bool = False
     # GAN augmentation / red-team (defensive)
     use_gan_augmentation: bool = False
     gan_backend: str = "surrogate"    # "surrogate" | "gan" | "auto"
@@ -139,7 +142,12 @@ class EEGBiometricPipeline:
             win_seconds=c.atar_win_seconds, decomposition=c.atar_decomposition,
         )
         self.feature_extractor = PerChannelFeatureExtractor()
-        self.liveness = LivenessDetector(amp_z_thresh=c.liveness_amp_z)
+        self.liveness = LivenessDetector(
+            amp_z_thresh=c.liveness_amp_z,
+            track_nonce=c.liveness_track_nonce,
+            max_age_seconds=c.liveness_max_age_seconds,
+            require_nonce_echo=c.liveness_require_nonce_echo,
+        )
         self.enrollments: Dict[str, Enrollment] = {}
 
     # ------------------------------------------------------------- helpers
@@ -345,7 +353,9 @@ def main() -> None:
     enrollee = "S001"
     eval_impostors = ["S002", "S003", "S004"]
     background_ids = ["B01", "B02", "B03", "B04"]
-    calib_impostor_id = "C01"        # 背景にも評価にも含まれない較正専用 impostor
+    # 較正専用 impostor は「複数の」素な被験者で（単一だと閾値が未知 impostor に汎化せず
+    # FAR が跳ねる: 単一 C01 では FAR≈0.29、5 人では FAR≈0.04）。
+    calib_impostor_ids = ["C01", "C02", "C03", "C04", "C05"]
 
     # 実運用の受理経路は必ずオンキュー瞬目を伴う。登録・較正・評価の全 trial に
     # 同条件の瞬目を入れ、ATAR 後の残差分布を train/eval で一致させる(誠実な指標)。
@@ -360,7 +370,9 @@ def main() -> None:
     background = []
     for k, bid in enumerate(background_ids):
         background += fetch(bid, 8, 100 + 10 * k)
-    calib_impostor = fetch(calib_impostor_id, 8, 200)
+    calib_impostor = []
+    for k, cid in enumerate(calib_impostor_ids):
+        calib_impostor += fetch(cid, 6, 200 + 10 * k)
 
     print("\nEnrolling", enrollee, "...")
     summary = pipe.enroll(enrollee, genuine_enroll, background,

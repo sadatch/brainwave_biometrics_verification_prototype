@@ -22,6 +22,17 @@ The three checks that defeat replays
 2. **Timing** — they fall *inside* the challenge window (a mistimed/old recording fails).
 3. **Pre-prompt cleanliness** — no blink appears *before* the prompt, which resists a
    spliced clip that simply contains a blink somewhere.
+
+Threat-model boundary (nonce binding)
+-------------------------------------
+The optional anti-replay binding (``require_nonce_echo`` / ``max_age_seconds`` /
+``track_nonce``) stops a captured stream from being **replayed** and binds a response to
+a single, time-limited, single-use challenge. But ``echoed_nonce`` is a *plaintext*
+field that is **not cryptographically bound to the signal**: on an unauthenticated link,
+an on-path attacker who can observe the challenge can copy the nonce, so the echo by
+itself only defeats *blind* replay. A production capture device should instead
+**MAC/sign ``(samples ‖ nonce)``** at the sensor; this module's nonce machinery is the
+software-side half of that protocol, not a substitute for it.
 """
 from __future__ import annotations
 
@@ -29,7 +40,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -107,6 +118,7 @@ class LivenessDetector:
         max_age_seconds: Optional[float] = None,
         require_nonce_echo: bool = False,
         track_nonce: bool = False,
+        max_consumed: int = 4096,
     ) -> None:
         self.frontal_channels = tuple(frontal_channels)
         self.amp_z_thresh = float(amp_z_thresh)
@@ -115,13 +127,28 @@ class LivenessDetector:
         self.max_blink_ms = float(max_blink_ms)
         self.refractory_ms = float(refractory_ms)
         self.require_clean_pre_prompt = bool(require_clean_pre_prompt)
-        # --- anti-replay の束縛（既定は無効。有効化すると nonce を実際に拘束する）---
+        # --- anti-replay の束縛 ---
         self.abs_uv_floor = float(abs_uv_floor)          # MAD≈0 の死にチャネル対策(µV)
         self.max_age_seconds = max_age_seconds            # 経過時間で失効
         self.require_nonce_echo = bool(require_nonce_echo)  # 応答に nonce エコー必須
         self.track_nonce = bool(track_nonce)              # 使用済み nonce を拒否
-        self._consumed: set = set()
+        self.max_consumed = int(max_consumed)             # 消費済み台帳の上限(無制限増加を防止)
+        self._consumed: Dict[str, float] = {}             # nonce -> 消費時刻(epoch秒)
         self._lock = threading.Lock()
+
+    def _prune_consumed_locked(self) -> None:
+        """消費済み nonce 台帳を剪定する（呼び出し側でロック済みであること）。
+
+        ``max_age_seconds`` を超えた項目は失効済みで再利用不可なので破棄してよい。
+        さらに ``max_consumed`` 件を超えたら古い順に間引く（無制限増加の防止）。
+        """
+        now = time.time()
+        if self.max_age_seconds is not None:
+            cutoff = now - float(self.max_age_seconds)
+            self._consumed = {k: v for k, v in self._consumed.items() if v >= cutoff}
+        if len(self._consumed) > self.max_consumed:
+            keep = sorted(self._consumed.items(), key=lambda kv: kv[1])[-self.max_consumed:]
+            self._consumed = dict(keep)
 
     # ----------------------------------------------------------- challenge
     def make_challenge(
@@ -214,10 +241,11 @@ class LivenessDetector:
         score = self._confidence(len(in_window), challenge.expected_blinks, prepane_ok)
         if passed and not reasons:
             reasons.append("bona_fide_on_cue_blink_detected")
-        # nonce を単回使用として消費（リプレイ拒否）。
+        # nonce を単回使用として消費（リプレイ拒否）。台帳は剪定し無制限増加を防ぐ。
         if self.track_nonce and consume:
             with self._lock:
-                self._consumed.add(challenge.nonce)
+                self._consumed[challenge.nonce] = time.time()
+                self._prune_consumed_locked()
         return LivenessResult(passed, len(in_window), len(pre_prompt),
                               challenge.expected_blinks, score, latency, reasons)
 

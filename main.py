@@ -178,11 +178,12 @@ class RingBuffer:
 # TCP 受信サーバ（バックグラウンドスレッド）
 # =========================================================================== #
 class EEGTCPServer(threading.Thread):
-    """``0.0.0.0:8888`` で待ち受け、36B パケットを解析してバッファへ書き込む。
+    """``HOST:PORT``（既定 ``127.0.0.1:8888``）で待ち受け、36B パケットを解析する。
 
     部分受信のバッファリング、クライアント切断・再接続、応答性のある停止
-    （``settimeout`` ベース）に対応する。GUI とは ``RingBuffer`` と
-    スレッドセーフな状態辞書のみを共有する。
+    （``settimeout`` ベース）、任意の共有トークン・ハンドシェイク（``SHARED_TOKEN``）
+    に対応する。全 IF への公開は ``EEG_HOST=0.0.0.0`` を明示した場合のみ。GUI とは
+    ``RingBuffer`` とスレッドセーフな状態辞書のみを共有する。
     """
 
     def __init__(self, buffer: RingBuffer, host: str = HOST, port: int = PORT) -> None:
