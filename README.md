@@ -31,6 +31,59 @@ main.py  ─── EEGTCPServer ──► RingBuffer
               8ch オシロスコープ + 認証ステータスパネル
 ```
 
+### システムフロー図（Mermaid）
+
+```mermaid
+flowchart TD
+    ESP32["ESP32\nADS1299, 8ch, 250Hz\nTCP バイナリストリーム\n36B/packet"]
+
+    subgraph main["main.py"]
+        TCP["EEGTCPServer\nTCP受信・再接続"]
+        BUF["RingBuffer\n固定長循環バッファ"]
+        IW["InferenceWorker\nQThread 1秒周期"]
+        TCP --> BUF --> IW
+    end
+
+    subgraph pipeline["EEGBiometricPipeline"]
+        RAW["RAW EEG"]
+
+        subgraph liveness_check["ライブネス検査（ISO/IEC 30107）"]
+            LD["LivenessDetector\n瞬目チャレンジ&レスポンス"]
+        end
+
+        ATAR["ATARPreprocessor\nウェーブレット\nアーティファクト除去"]
+        EN["ElasticNetChannelSelector\n安定チャネル選択"]
+
+        subgraph encoder["特徴抽出"]
+            MAEEG["MAEEGEncoder\nGMAEEGEncoder\n深層特徴量"]
+            HC["HandcraftedSpectralEncoder\n手作りスペクトル特徴量"]
+        end
+
+        subgraph recognizer["識別（オープンセット）"]
+            OCSVM["OC-SVM\n未知他人対応"]
+            LGBM["LightGBM\n既知他人識別"]
+            FUSE["Platt 融合\nAND ロジック"]
+            OCSVM & LGBM --> FUSE
+        end
+
+        REJECT["❌ REJECT\nリプレイ / スプーフ検出"]
+        ACCEPT["✅ ACCEPT\n本人照合成功"]
+
+        RAW --> LD
+        LD -- fail --> REJECT
+        LD -- pass --> ATAR --> EN --> encoder
+        encoder --> recognizer
+        FUSE -- ACCEPT --> ACCEPT
+        FUSE -- REJECT --> REJECT
+    end
+
+    GUI["EEGDashboard\n8ch オシロスコープ\n認証ステータスパネル"]
+
+    ESP32 --> TCP
+    IW --> RAW
+    pipeline --> GUI
+```
+
 ---
 
 ## リポジトリ構成
