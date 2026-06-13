@@ -1,0 +1,12 @@
+# --- Core (required) ---
+numpy>=1.21
+
+# --- Recommended (graceful NumPy fallbacks exist if any are missing) ---
+scipy>=1.7            # filtering / Welch PSD / peak finding   (else numpy fallbacks)
+scikit-learn>=1.0    # Elastic-Net logistic, One-Class SVM, scaling (else numpy fallbacks)
+PyWavelets>=1.1      # ATAR wavelet transform                  (else robust-amplitude attenuation)
+
+# --- Optional (unlock the deep / boosted paths) ---
+torch>=1.12          # MAEEG / GMAEEG encoder + EEG-GAN        (else handcrafted encoder + surrogate generator)
+lightgbm>=3.3        # boosted discriminative branch           (else gradient-boosting / logreg)
+mne>=1.0             # PhysioNet EEGBCI public sample data      (else synthetic waveforms)
